@@ -25,8 +25,6 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 # Copy the project
 COPY app ./app
 COPY assets ./assets
-COPY data ./data
-COPY models ./models
 COPY README.md ./README.md
 
 # Ensure runtime directories exist (and can be mounted as volumes)
