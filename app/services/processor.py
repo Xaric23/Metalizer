@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock
-from typing import Any, Dict, Literal
+from typing import Any, Dict, Literal, Protocol, cast
 
 import librosa
 import numpy as np
+from numpy.typing import NDArray
 import soundfile as sf
 from loguru import logger
 from pydub import AudioSegment
@@ -15,12 +17,6 @@ from pydub.generators import Sine, WhiteNoise
 from scipy import signal
 
 from app.core.config import get_settings
-
-try:  # Heavy dependencies are imported lazily to keep startup fast
-    from spleeter.separator import Separator
-except Exception:  # pragma: no cover - exercised only when spleeter missing
-    Separator = None  # type: ignore
-
 
 class SeparationError(RuntimeError):
     """Raised when both separation backends fail."""
@@ -54,6 +50,11 @@ class PipelineContext:
         return path
 
 
+class _SeparatorProtocol(Protocol):
+    def separate(self, waveform_path: str) -> Dict[str, np.ndarray]:
+        ...
+
+
 class MetalizerPipeline:
     """High-level orchestration for the Metalizer audio transformation."""
 
@@ -72,7 +73,7 @@ class MetalizerPipeline:
         self.demucs_model = demucs_model
         self.demucs_device = demucs_device or self._auto_select_device()
         self.sample_rate = self.config.sample_rate
-        self._spleeter_separator: Separator | None = None
+        self._spleeter_separator: _SeparatorProtocol | None = None
         self._demucs_model = None
         self._demucs_lock = Lock()
 
@@ -96,9 +97,10 @@ class MetalizerPipeline:
 
         logger.debug("Ingesting audio", path=audio_path)
         audio, _ = librosa.load(audio_path, sr=self.sample_rate, mono=False)
-        if audio.ndim == 1:
-            audio = np.expand_dims(audio, axis=0)
-        normalized = librosa.util.normalize(audio, axis=1)
+        audio_array: NDArray[np.floating[Any]] = np.asarray(audio)
+        if audio_array.ndim == 1:
+            audio_array = np.expand_dims(audio_array, axis=0)
+        normalized = librosa.util.normalize(audio_array, axis=1)
         normalized_path = ctx.allocate("normalized.wav")
         sf.write(normalized_path, normalized.T, self.sample_rate)
         return normalized_path
@@ -125,25 +127,31 @@ class MetalizerPipeline:
             ) from err
 
     def _separate_with_spleeter(self, audio_path: Path, ctx: PipelineContext) -> Dict[str, Path]:
-        if Separator is None:
-            raise ImportError("spleeter is not installed")
-
-        if self._spleeter_separator is None:
-            self._spleeter_separator = Separator(self.spleeter_model)
+        separator = self._get_spleeter_separator()
 
         logger.debug("Running Spleeter", model=self.spleeter_model)
-        prediction = self._spleeter_separator.separate(str(audio_path))
+        prediction = separator.separate(str(audio_path))
         vocals_path = ctx.allocate("vocals.wav")
         accomp_path = ctx.allocate("accompaniment.wav")
         sf.write(vocals_path, prediction["vocals"], self.sample_rate)
         sf.write(accomp_path, prediction["accompaniment"], self.sample_rate)
         return {"vocals": vocals_path, "accompaniment": accomp_path}
 
+    def _get_spleeter_separator(self) -> _SeparatorProtocol:
+        if self._spleeter_separator is None:
+            self._spleeter_separator = self._create_spleeter_separator()
+        return self._spleeter_separator
+
+    def _create_spleeter_separator(self) -> _SeparatorProtocol:
+        try:  # pragma: no cover - optional dependency
+            module = importlib.import_module("spleeter.separator")
+            separator_cls = getattr(module, "Separator")
+        except ModuleNotFoundError as exc:  # pragma: no cover - exercised when spleeter missing
+            raise ImportError("spleeter is not installed") from exc
+        return cast(_SeparatorProtocol, separator_cls(self.spleeter_model))
+
     def _separate_with_demucs(self, audio_path: Path, ctx: PipelineContext) -> Dict[str, Path]:
-        import torch
-        from demucs.apply import apply_model
-        from demucs.audio import AudioFile
-        from demucs.pretrained import get_model
+        torch, apply_model, AudioFile, get_model = self._load_demucs_dependencies()
 
         logger.debug("Running Demucs", model=self.demucs_model, device=self.demucs_device)
 
@@ -172,6 +180,21 @@ class MetalizerPipeline:
         sf.write(vocals_path, vocals.T, self.sample_rate)
         sf.write(accomp_path, accompaniment.T, self.sample_rate)
         return {"vocals": vocals_path, "accompaniment": accomp_path}
+
+    def _load_demucs_dependencies(self) -> tuple[Any, Any, Any, Any]:
+        try:  # pragma: no cover - optional dependency
+            torch = importlib.import_module("torch")
+            apply_module = importlib.import_module("demucs.apply")
+            audio_module = importlib.import_module("demucs.audio")
+            pretrained_module = importlib.import_module("demucs.pretrained")
+        except ModuleNotFoundError as exc:  # pragma: no cover - exercised when demucs missing
+            raise ImportError("demucs and torch must be installed for demucs separation") from exc
+        return (
+            torch,
+            getattr(apply_module, "apply_model"),
+            getattr(audio_module, "AudioFile"),
+            getattr(pretrained_module, "get_model"),
+        )
 
     def _analyze(self, accompaniment_path: Path) -> AnalysisResult:
         """Detect BPM, beat grid, key and tuning with librosa."""
@@ -244,12 +267,20 @@ class MetalizerPipeline:
         gain = 10 ** (drive / 20)
         processed = np.tanh(audio * gain)
         cutoff = 80 / (self.sample_rate / 2)
-        b, a = signal.butter(N=2, Wn=cutoff, btype="highpass")
+        butter_coeffs = cast(
+            tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]]],
+            signal.butter(N=2, Wn=cutoff, btype="highpass"),
+        )
+        b, a = butter_coeffs
         if processed.ndim == 1:
-            filtered = signal.lfilter(b, a, processed)
+            filtered = cast(NDArray[np.floating[Any]], signal.lfilter(b, a, processed))
         else:
-            filtered = np.vstack([signal.lfilter(b, a, ch) for ch in processed])
-        return librosa.util.normalize(filtered, axis=-1)
+            filtered = np.vstack(
+                [cast(NDArray[np.floating[Any]], signal.lfilter(b, a, ch)) for ch in processed]
+            )
+        filtered_array = cast(NDArray[np.floating[Any]], filtered)
+        normalized = librosa.util.normalize(filtered_array, axis=-1)
+        return cast(NDArray[np.floating[Any]], normalized)
 
     def _generate_metal_drums(self, bpm: float, duration_seconds: float) -> AudioSegment:
         track = AudioSegment.silent(duration=int(duration_seconds * 1000) + 1000)
@@ -299,11 +330,11 @@ class MetalizerPipeline:
         if len(segment) == target_ms:
             return segment
         if len(segment) > target_ms:
-            return segment[:target_ms]
+            return cast(AudioSegment, segment[:target_ms])
         looped = AudioSegment.silent(duration=0)
         while len(looped) < target_ms:
             looped += segment
-        return looped[:target_ms]
+        return cast(AudioSegment, looped[:target_ms])
 
     def _estimate_key(self, chroma: np.ndarray) -> str:
         krumhansl_major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -329,7 +360,7 @@ class MetalizerPipeline:
 
     def _auto_select_device(self) -> str:
         try:  # pragma: no cover - torch availability depends on environment
-            import torch
+            torch = importlib.import_module("torch")
         except Exception:
             return "cpu"
         return "cuda" if torch.cuda.is_available() else "cpu"
