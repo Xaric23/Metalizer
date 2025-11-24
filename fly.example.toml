@@ -1,5 +1,5 @@
 # Rename this file to fly.toml after running `fly launch` and adjusting the app name/region.
-app = "metalizer-app"  # <-- change to your unique Fly app name
+app = "metalizer"
 primary_region = "iad"
 
 [build]
